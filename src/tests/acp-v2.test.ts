@@ -362,6 +362,38 @@ describe("ACP protocol routing", () => {
     expect(response).toMatchObject({ id: 1, result: { protocolVersion: 1 } });
   });
 
+  it("negotiates v1 for clients sending protocolVersion: 2 with v1 syntax (buzz-acp)", async () => {
+    const stream = connectRouter("auto");
+    const writer = stream.writable.getWriter();
+    await writer.write({
+      jsonrpc: "2.0",
+      id: 42,
+      method: "initialize",
+      params: {
+        protocolVersion: 2,
+        clientCapabilities: {
+          _meta: { goose: { customNotifications: true } },
+          auth: { terminal: true },
+        },
+        clientInfo: { name: "buzz-acp", version: "0.1.0" },
+      },
+    });
+    const reader = stream.readable.getReader();
+    let response: v2.AnyMessage | undefined;
+    while (!response) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if ("id" in value && value.id === 42) response = value;
+    }
+    await writer.close();
+
+    expect(response).toMatchObject({
+      jsonrpc: "2.0",
+      id: 42,
+      result: { protocolVersion: 1 },
+    });
+  });
+
   it("rejects a v1 client when limited to v2", async () => {
     const initialize = v1
       .client({ name: "v1-test-client" })

@@ -63,5 +63,41 @@ export function acpProtocolRouter(
   const router = v2.agentProtocolRouter();
   if (protocols !== "v2") router.withV1(v1AgentApp(logger, onAgent));
   if (protocols !== "v1") router.withV2(v2AgentApp(logger, onAgent));
+
+  // Intercept routeInitialize to handle clients (such as buzz-acp) that advertise
+  // protocolVersion >= 2 but send ACP v1 parameter schema (clientCapabilities / clientInfo,
+  // without the required v2 info property). If left as v2, Zod throws -32602 "Invalid params: info expected".
+  // Normalizing protocolVersion to 1 allows the router to route directly to ACP v1.
+  const routable = router as unknown as {
+    routeInitialize: (message: unknown) => unknown;
+  };
+  const originalRouteInitialize = routable.routeInitialize.bind(router);
+  routable.routeInitialize = (message: unknown) => {
+    if (
+      protocols !== "v2" &&
+      typeof message === "object" &&
+      message !== null &&
+      "method" in message &&
+      (message as { method?: unknown }).method === "initialize" &&
+      "params" in message &&
+      typeof (message as { params?: unknown }).params === "object" &&
+      (message as { params?: Record<string, unknown> }).params !== null
+    ) {
+      const params = (message as { params: Record<string, unknown> }).params;
+      if (
+        typeof params.protocolVersion === "number" &&
+        params.protocolVersion >= 2 &&
+        ("clientCapabilities" in params || "clientInfo" in params) &&
+        !("info" in params)
+      ) {
+        logger?.log?.(
+          `Normalizing initialize protocolVersion from ${params.protocolVersion} to 1 for client using v1 parameters`,
+        );
+        params.protocolVersion = 1;
+      }
+    }
+    return originalRouteInitialize(message);
+  };
+
   return router;
 }
