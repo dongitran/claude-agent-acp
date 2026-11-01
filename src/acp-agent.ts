@@ -58,6 +58,12 @@ import {
 } from "@agentclientprotocol/sdk/unstable";
 import type { ForegroundEvents, StopReason, TurnEvents, TurnOutcome } from "./turn-events.js";
 import {
+  initTelemetry,
+  parseNostrContext,
+  type TelemetryService,
+  type TurnSpanHandle,
+} from "./telemetry.js";
+import {
   AccountInfo,
   AgentInfo,
   CanUseTool,
@@ -992,6 +998,7 @@ type Turn = {
   carriedModelUsage?: ModelTokenTally;
   resolve: (outcome: TurnOutcome) => void;
   reject: (error: unknown) => void;
+  telemetryHandle?: TurnSpanHandle;
   /** Settles once the turn has ended or failed. */
   completion?: Promise<void>;
 };
@@ -2862,6 +2869,8 @@ export class ClaudeAcpAgent {
     );
   }
 
+  telemetry: TelemetryService | null = null;
+
   constructor(
     client: AcpClient,
     logger?: Logger,
@@ -2882,6 +2891,7 @@ export class ClaudeAcpAgent {
     this.sessions = {};
     this.client = new ChangedMetaClient(client, () => this.toolCallCapabilities.air.client);
     this.logger = logger ?? console;
+    this.telemetry = initTelemetry(this.logger);
     this.exitPlan = new ExitPlanCoordinator<Session, Turn>({
       currentSession: (id) => this.sessions[id],
       closeQueryStream: (session) => this.closeQueryStream(session),
@@ -4083,11 +4093,23 @@ export class ClaudeAcpAgent {
     // turn's outcome is known. `startTurn()` owns no loop: it enqueues the
     // turn, pushes the user message onto the streaming input, and makes sure
     // the consumer is running.
+    let telemetryHandle: TurnSpanHandle | undefined;
+    if (this.telemetry) {
+      const nostrMeta = parseNostrContext(firstText);
+      telemetryHandle = this.telemetry.startTurnSpan(
+        params.sessionId,
+        firstText,
+        session.models?.currentModelId,
+        nostrMeta,
+      );
+    }
+
     let completeTurn!: () => void;
     const turn: Turn = {
       received,
       promptUuid,
       events,
+      telemetryHandle,
       isLocalOnlyCommand,
       ...(localCommand ? { localCommand } : {}),
       ...(localCommandAbort ? { localCommandAbort } : {}),
@@ -4097,11 +4119,15 @@ export class ClaudeAcpAgent {
         completeTurn = resolve;
       }),
       resolve: (outcome) => {
+        turn.telemetryHandle?.end(outcome.stopReason === "cancelled" ? "CANCELLED" : "OK");
+        this.telemetry?.backgroundFlush(1500);
         this.endForeground(params.sessionId, turn, { outcome });
         events.ended(outcome);
         completeTurn();
       },
       reject: (error) => {
+        turn.telemetryHandle?.end("ERROR", error instanceof Error ? error.message : String(error));
+        this.telemetry?.backgroundFlush(1500);
         this.endForeground(params.sessionId, turn, { error });
         events.failed(error);
         completeTurn();
@@ -5625,6 +5651,7 @@ export class ClaudeAcpAgent {
           toolUseResult: results.length === resultCount ? message.tool_use_result : undefined,
           toolResultMeta: (message as { tool_result_meta?: unknown }).tool_result_meta,
           cancelled: true,
+          telemetryHandle: session.activeTurn?.telemetryHandle,
         },
       )) {
         await sendUpdate(notification);
@@ -7272,6 +7299,10 @@ export class ClaudeAcpAgent {
                 session.accumulatedUsage.cachedReadTokens += message.usage.cache_read_input_tokens;
                 session.accumulatedUsage.cachedWriteTokens +=
                   message.usage.cache_creation_input_tokens;
+                session.activeTurn?.telemetryHandle?.recordUsage(
+                  message.usage,
+                  message.total_cost_usd,
+                );
               }
 
               const matchingModelUsage = lastAssistantModel
@@ -8550,6 +8581,7 @@ export class ClaudeAcpAgent {
                   message.type === "user"
                     ? (message as { tool_result_meta?: unknown }).tool_result_meta
                     : undefined,
+                telemetryHandle: session.activeTurn?.telemetryHandle,
               },
             )) {
               // sendUpdate records delivery. Subagent text/thinking is
@@ -10480,6 +10512,12 @@ export class ClaudeAcpAgent {
       return;
     }
     session.emittedToolCalls.add(toolCallId);
+    session.activeTurn?.telemetryHandle?.startToolSpan(
+      toolCallId,
+      toolName,
+      toolInput,
+      toolName === "Agent" || toolName === "Task",
+    );
     if (parentToolUseId) recordToolCallParent(session, toolCallId, parentToolUseId);
     // SandboxNetworkAccess is a permission-only callback, not an executing
     // tool: the SDK does not send a tool_result for its synthetic id.
@@ -12065,6 +12103,11 @@ export class ClaudeAcpAgent {
       // Opt-in to session state events like when the agent is idle
       CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
     };
+    // Layer 2 environment isolation: ensure Nostr private keys and auth tags do not leak into child process
+    delete (env as Record<string, unknown>).BUZZ_PRIVATE_KEY;
+    delete (env as Record<string, unknown>).BUZZ_AUTH_TAG;
+    delete (env as Record<string, unknown>).NSEC;
+    delete (env as Record<string, unknown>).NOSTR_SECRET;
     // Scopes the context-window cache to this query's backend (see
     // `contextWindowCache`). Derived from the same `env` object handed to the
     // SDK, so per-session `_meta` env routing and ambient process-env routing
@@ -14071,6 +14114,7 @@ export function toAcpNotifications(
     cancelled?: boolean;
     // True when the content comes from the history of a loaded session.
     replay?: boolean;
+    telemetryHandle?: TurnSpanHandle;
   },
 ): SessionNotification[] {
   const taskState = options?.taskState ?? new Map();
@@ -14236,6 +14280,14 @@ export function toAcpNotifications(
           // A permission request surfaced the tool call with its complete
           // input. The empty input at the stream start has nothing to add.
           if (alreadyEmitted && options?.inputComplete === false) break;
+          if (options?.inputComplete !== false) {
+            options?.telemetryHandle?.startToolSpan(
+              chunk.id,
+              chunk.name,
+              rawInput ?? chunk.input,
+              chunk.name === "Agent" || chunk.name === "Task",
+            );
+          }
           update = alreadyEmitted
             ? // Already surfaced (full assistant message after streaming, or a
               // permission request emitted it first): refine it with the
@@ -14294,6 +14346,11 @@ export function toAcpNotifications(
         options?.emittedToolCalls?.delete(chunk.tool_use_id);
         completeHookCallback(chunk.tool_use_id);
         finishedToolCallId = chunk.tool_use_id;
+        options?.telemetryHandle?.endToolSpan(
+          chunk.tool_use_id,
+          chunk.content,
+          "is_error" in chunk && chunk.is_error === true,
+        );
         // Why this is_error result carries harness prose instead of tool
         // output (user-rejected / interrupted / …), when the SDK said so.
         // Spread into the claudeCode meta of every update emitted below; the
@@ -14508,6 +14565,7 @@ export function streamEventToAcpNotifications(
     toolCallFields?: ToolCallFieldTracker;
     messageId?: string;
     streamedToolInputs?: StreamedToolInputCache;
+    telemetryHandle?: TurnSpanHandle;
   },
 ): SessionNotification[] {
   const event = message.event;
@@ -14522,6 +14580,7 @@ export function streamEventToAcpNotifications(
     emittedToolCalls: options?.emittedToolCalls,
     toolCallFields: options?.toolCallFields,
     messageId: options?.messageId,
+    telemetryHandle: options?.telemetryHandle,
   };
   switch (event.type) {
     case "content_block_start": {
