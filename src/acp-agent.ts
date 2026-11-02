@@ -999,6 +999,7 @@ type Turn = {
   resolve: (outcome: TurnOutcome) => void;
   reject: (error: unknown) => void;
   telemetryHandle?: TurnSpanHandle;
+  assistantText?: string;
   /** Settles once the turn has ended or failed. */
   completion?: Promise<void>;
 };
@@ -4046,6 +4047,10 @@ export class ClaudeAcpAgent {
     // Local-only commands (e.g. `/clear`) return a result without replaying the
     // user message, so the consumer can't promote the turn from the echo.
     const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
+    const textBlocks = params.prompt
+      .filter((c): c is { type: "text"; text: string } => c.type === "text")
+      .map((c) => c.text);
+    const combinedPromptText = textBlocks.join("\n\n");
     const isLocalOnlyCommand =
       firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
 
@@ -4095,10 +4100,12 @@ export class ClaudeAcpAgent {
     // the consumer is running.
     let telemetryHandle: TurnSpanHandle | undefined;
     if (this.telemetry) {
-      const nostrMeta = parseNostrContext(firstText);
+      const nostrMeta = parseNostrContext(combinedPromptText);
+      const promptForSpan =
+        textBlocks.find((t) => t.includes("Event ID:")) ?? (firstText || combinedPromptText);
       telemetryHandle = this.telemetry.startTurnSpan(
         params.sessionId,
-        firstText,
+        promptForSpan,
         session.models?.currentModelId,
         nostrMeta,
       );
@@ -4119,7 +4126,10 @@ export class ClaudeAcpAgent {
         completeTurn = resolve;
       }),
       resolve: (outcome) => {
-        turn.telemetryHandle?.end(outcome.stopReason === "cancelled" ? "CANCELLED" : "OK");
+        turn.telemetryHandle?.end(
+          outcome.stopReason === "cancelled" ? "CANCELLED" : "OK",
+          turn.assistantText,
+        );
         this.telemetry?.backgroundFlush(1500);
         this.endForeground(params.sessionId, turn, { outcome });
         events.ended(outcome);
@@ -4893,6 +4903,10 @@ export class ClaudeAcpAgent {
         if (!claudeMeta?.parentToolUseId) {
           session.emittedAssistantText = true;
           session.titles.onAssistantText(update.content);
+          if (update.content.type === "text" && session.activeTurn) {
+            session.activeTurn.assistantText =
+              (session.activeTurn.assistantText ?? "") + update.content.text;
+          }
         }
       }
       await this.client.sessionUpdate(routedNotification);
@@ -12103,11 +12117,6 @@ export class ClaudeAcpAgent {
       // Opt-in to session state events like when the agent is idle
       CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
     };
-    // Layer 2 environment isolation: ensure Nostr private keys and auth tags do not leak into child process
-    delete (env as Record<string, unknown>).BUZZ_PRIVATE_KEY;
-    delete (env as Record<string, unknown>).BUZZ_AUTH_TAG;
-    delete (env as Record<string, unknown>).NSEC;
-    delete (env as Record<string, unknown>).NOSTR_SECRET;
     // Scopes the context-window cache to this query's backend (see
     // `contextWindowCache`). Derived from the same `env` object handed to the
     // SDK, so per-session `_meta` env routing and ambient process-env routing
