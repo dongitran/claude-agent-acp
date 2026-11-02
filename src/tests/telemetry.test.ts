@@ -225,6 +225,36 @@ Xin chào bạn`;
         "4444444444444444444444444444444444444444444444444444444444444444",
       );
     });
+
+    it("extracts Nostr envelope from multi-block prompt batches", () => {
+      const blocks = [
+        "[Base system instructions that are 15KB long...]",
+        "[Agent specific instructions...]",
+        "[Agent Memory — core]",
+        "[Context: previous events...]",
+        `Channel: twin (#01fd5ea1-0089-471b-9aac-96e54993a4ab)
+Thread root: 6d6154848b8097cfa1ba068e7bd0d8a300000000000000000000000000000000
+Event ID: 22bf0d552a1a6e2dc95987f3979abac8142e06e9e6f11c9002b418fdca207c33
+From: elio.tran (npub: npub1author, hex: a666af900255fef167708bc019a1b56c0c801416b86deebe3a4e1efda1fe5b0c)
+
+@Claude Twin Hello from test`,
+      ];
+
+      // Combining text blocks
+      const combined = blocks.join("\n\n");
+      const meta = parseNostrContext(combined);
+
+      expect(meta.channelId).toBe("01fd5ea1-0089-471b-9aac-96e54993a4ab");
+      expect(meta.channelName).toBe("twin");
+      expect(meta.eventId).toBe("22bf0d552a1a6e2dc95987f3979abac8142e06e9e6f11c9002b418fdca207c33");
+      expect(meta.threadRootId).toBe(
+        "6d6154848b8097cfa1ba068e7bd0d8a300000000000000000000000000000000",
+      );
+      expect(meta.senderName).toBe("elio.tran");
+      expect(meta.senderPubkey).toBe(
+        "a666af900255fef167708bc019a1b56c0c801416b86deebe3a4e1efda1fe5b0c",
+      );
+    });
   });
 
   describe("Turn Span Lifecycle & Single-Flight Coalesced Flush", () => {
