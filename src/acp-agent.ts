@@ -60,6 +60,7 @@ import type { ForegroundEvents, StopReason, TurnEvents, TurnOutcome } from "./tu
 import {
   initTelemetry,
   parseNostrContext,
+  parseSteeredMessage,
   type TelemetryService,
   type TurnSpanHandle,
 } from "./telemetry.js";
@@ -4567,6 +4568,7 @@ export class ClaudeAcpAgent {
    *  `session/prompt`. Without the opt-in, the existing detached `prompt()` and
    *  `startedNewTurn` result are preserved for compatibility. */
   async steer(params: SteerRequest): Promise<SteerResponse> {
+    const arrivedAt = Date.now();
     const sessionId = params.sessionId;
     let session = this.sessions[sessionId];
     if (!session) {
@@ -4619,8 +4621,11 @@ export class ClaudeAcpAgent {
     userMessage.uuid = steeredUuid;
     // Deliver into the running turn rather than queuing behind it as a fresh
     // prompt would.
-    userMessage.priority =
+    const priority =
       (session.openUserInputs?.size ?? 0) > 0 ? STEER_PRIORITY_LATER : STEER_PRIORITY_NOW;
+    userMessage.priority = priority;
+    // Before the push, so that no echo or settle can come ahead of the span it ends.
+    this.startSteerSpan(sessionId, turnInFlight, steeredUuid, priority, params.prompt, arrivedAt);
     // Mark before the push and in the same synchronous section as the in-flight
     // check: the interrupt can have the CLI finalizing the aborted cycle by the
     // time the consumer next runs, and an unmarked result would settle the turn
@@ -4641,6 +4646,41 @@ export class ClaudeAcpAgent {
     const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
     await this.publishGoalFromPrompt(sessionId, firstText, steeredUuid);
     return { outcome: "injected" };
+  }
+
+  /** Records a message steered into `turn` as a `steer` span under the turn's span (see
+   *  `TurnSpanHandle.startSteerSpan`). Does nothing when tracing is off, and never throws: a steer is delivered the
+   *  same way with a trace as without one. */
+  private startSteerSpan(
+    sessionId: string,
+    turn: Turn,
+    uuid: string,
+    priority: "now" | "later",
+    prompt: PromptRequest["prompt"],
+    arrivedAt: number,
+  ): void {
+    const handle = turn.telemetryHandle;
+    if (!handle) return;
+    try {
+      const textBlocks = prompt
+        .filter((c): c is { type: "text"; text: string } => c.type === "text")
+        .map((c) => c.text);
+      const combined = textBlocks.join("\n\n");
+      // As a turn's own span takes its prompt: the block that holds the Buzz event, else the first text.
+      const firstText = prompt[0]?.type === "text" ? prompt[0].text : "";
+      const text = textBlocks.find((t) => t.includes("Event ID:")) ?? (firstText || combined);
+      handle.startSteerSpan({
+        uuid,
+        text,
+        priority,
+        nostrMeta: parseSteeredMessage(combined),
+        arrivedAt,
+      });
+    } catch (error) {
+      this.logger.error(
+        `Session ${sessionId}: could not record a steered message in the trace: ${error}`,
+      );
+    }
   }
 
   async stopAsyncTask(params: AsyncTaskStopRequest): Promise<AsyncTaskStopResponse> {
@@ -7224,7 +7264,11 @@ export class ClaudeAcpAgent {
                   let answersSteer = false;
                   for (const uuid of consumed) {
                     steeredTurn.steeredEchoes.delete(uuid);
-                    if (steeredTurn.steeredUuids?.has(uuid)) answersSteer = true;
+                    if (steeredTurn.steeredUuids?.has(uuid)) {
+                      answersSteer = true;
+                      // A steer the result names was taken even if its echo never came.
+                      steeredTurn.telemetryHandle?.endSteerSpan(uuid, "result");
+                    }
                   }
                   if (answersSteer && steeredTurn.steeredEchoes.size === 0) {
                     leaveSteerLane(steeredTurn);
@@ -8244,6 +8288,8 @@ export class ClaudeAcpAgent {
                   session.activeTurn.steeredEchoes.delete(message.uuid)
                 ) {
                   session.activeTurn.steeredAwaitingResult = true;
+                  // The SDK took the message: its `steer` span ends here.
+                  session.activeTurn.telemetryHandle?.endSteerSpan(message.uuid, "echo");
                 }
                 // A message typed in another client of the session (Remote
                 // Control from claude.ai or the mobile app). The adapter's own

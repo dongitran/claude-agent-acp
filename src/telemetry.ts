@@ -1,5 +1,9 @@
 import { trace, context, SpanStatusCode, type Span } from "@opentelemetry/api";
-import { NodeTracerProvider, BatchSpanProcessor } from "@opentelemetry/sdk-trace-node";
+import {
+  NodeTracerProvider,
+  BatchSpanProcessor,
+  type SpanProcessor,
+} from "@opentelemetry/sdk-trace-node";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
 import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
@@ -238,6 +242,109 @@ export function parseNostrContext(rawText: string): NostrMetadata {
   return result;
 }
 
+/** What stands in `From:` when the sender has no display name: `npub1… (hex: …)`. */
+const BARE_IDENTITY = /^(?:npub1[0-9a-z]+|[0-9a-f]{64})$/i;
+
+/** Most of a steered message that is read for its ids: buzz-acp's block is far smaller than this. */
+const STEERED_PARSE_CHARS = 262144;
+
+/**
+ * Reads the ids of a message steered into a running turn: one event block, as buzz-acp renders it.
+ *
+ * It differs from `parseNostrContext` in two ways. The block starts at its first `Event ID:` line and its header (the
+ * lines before `Content:`) is read from there, so that a message that quotes `Event ID: …` in its own text cannot
+ * name another event; `Parsed:` is the block's last such line, after the text, for the same reason. And a steered
+ * message is rendered without the profile lookup the opening prompt gets, so `From:` usually reads `npub1… (hex: …)`:
+ * a sender name is kept only when the block has one.
+ */
+export function parseSteeredMessage(rawText: string): NostrMetadata {
+  const result: NostrMetadata = {};
+  const text = rawText.slice(0, STEERED_PARSE_CHARS);
+  const start = text.search(/^Event ID:/m);
+  if (start === -1) return result;
+  const block = text.slice(start);
+  const contentAt = block.search(/^Content:/m);
+  const header = contentAt === -1 ? block : block.slice(0, contentAt);
+
+  const eventId = /^Event ID:[ \t]*([a-f0-9]{64})[ \t]*$/im.exec(header);
+  if (eventId) result.eventId = eventId[1].toLowerCase();
+
+  const channelId =
+    /^Channel:[ \t]*(?:[^\n]*\(#)?([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\)?[ \t]*$/im.exec(
+      header,
+    );
+  if (channelId) result.channelId = channelId[1].toLowerCase();
+
+  const from =
+    /^From:[ \t]*(.+?)[ \t]*\((?:[^)\n]*?hex:[ \t]*([a-f0-9]{64}))[^)\n]*\)[ \t]*$/im.exec(header);
+  if (from) {
+    result.senderPubkey = from[2].toLowerCase();
+    const name = from[1].trim();
+    if (name && !BARE_IDENTITY.test(name)) result.senderName = name;
+  }
+
+  const parsed = [...block.matchAll(/^Parsed:[ \t]*(.*)$/gm)].pop()?.[1] ?? "";
+  const parent = /\bparent=([a-f0-9]{64})\b/i.exec(parsed);
+  if (parent) result.replyToId = parent[1].toLowerCase();
+  const root = /\broot=([a-f0-9]{64})\b/i.exec(parsed);
+  // A message with no root of its own starts its thread, as the opening prompt's parser has it
+  if (root) result.threadRootId = root[1].toLowerCase();
+  else if (result.eventId) result.threadRootId = result.eventId;
+
+  return result;
+}
+
+/** Tools whose result names the Buzz message they posted: `posted (N characters) · event_id <64 hex>`. */
+const POSTED_EVENT_TOOLS = new Set(["mcp__buzz-thread__reply"]);
+
+/** Longest part of a tool result searched for the posted id; the id is at its start. */
+const POSTED_EVENT_SEARCH_CHARS = 4096;
+
+/** Most `steer` spans one turn records, so that a channel flooding an agent with mentions cannot flood the trace. */
+export const MAX_STEER_SPANS_PER_TURN = 200;
+
+/** The text blocks of a tool result: a string, a content block, or a list of blocks. */
+function toolResultTexts(output: unknown, depth = 0): string[] {
+  if (typeof output === "string") return [output];
+  if (output === null || typeof output !== "object" || depth > 2) return [];
+  if (Array.isArray(output)) return output.flatMap((block) => toolResultTexts(block, depth + 1));
+  const record = output as Record<string, unknown>;
+  const texts: string[] = [];
+  if (typeof record.text === "string") texts.push(record.text);
+  if (record.content !== undefined) texts.push(...toolResultTexts(record.content, depth + 1));
+  return texts;
+}
+
+/**
+ * The id of the Buzz message a posting tool returned: the 64 lowercase hex characters after `event_id `, and nothing
+ * else of the result. Undefined when the result holds no such id.
+ */
+export function extractPostedEventId(output: unknown): string | undefined {
+  for (const text of toolResultTexts(output)) {
+    const match = /\bevent_id ([0-9a-f]{64})(?![0-9a-f])/.exec(
+      text.slice(0, POSTED_EVENT_SEARCH_CHARS),
+    );
+    if (match) return match[1];
+  }
+  return undefined;
+}
+
+/** A message steered into a running turn (see `TurnSpanHandle.startSteerSpan`). */
+export interface SteerSpanInput {
+  /** The uuid the steered message was pushed to the SDK with. Its echo, or a result that names it, ends the span. */
+  uuid: string;
+  /** The steered message as the agent received it. Redacted and truncated here, as a turn's prompt is. */
+  text: string;
+  /** How the SDK was told to deliver it: `later` while a permission or elicitation request is open. */
+  priority: "now" | "later";
+  nostrMeta?: NostrMetadata;
+  /** When the steer arrived, in milliseconds since the epoch: where the span starts. */
+  arrivedAt?: number;
+}
+
+/** What ended a `steer` span before the turn did: the SDK's echo of the message, or a result that names it. */
+export type SteerDelivery = "echo" | "result";
+
 export interface TurnSpanHandle {
   startToolSpan(
     toolCallId: string,
@@ -246,6 +353,14 @@ export interface TurnSpanHandle {
     isSubagent?: boolean,
   ): void;
   endToolSpan(toolCallId: string, output?: unknown, isError?: boolean, toolName?: string): void;
+  /**
+   * Records a message injected into this turn as a `steer` child span of the turn's span. The span stays open until
+   * `endSteerSpan` names it, or until the turn ends (`end` closes it with `steer.delivered=false`). A no-op once the
+   * turn has ended. Never throws: tracing must not change how a steer is delivered.
+   */
+  startSteerSpan(steer: SteerSpanInput): void;
+  /** The SDK took the steered message: ends its span with `steer.delivered=true`. Unknown or ended uuids are ignored. */
+  endSteerSpan(uuid: string, delivery: SteerDelivery): void;
   recordUsage(usage: AnthropicUsage, totalCostUsd?: number): void;
   end(
     status: "OK" | "ERROR" | "CANCELLED",
@@ -323,7 +438,15 @@ export function getPackageVersion(): string {
   }
 }
 
-export function initTelemetry(logger?: Logger): TelemetryService | null {
+export interface TelemetryInitOptions {
+  /** Takes the finished spans in place of the OTLP exporter. For tests, which read the spans back. */
+  spanProcessors?: SpanProcessor[];
+}
+
+export function initTelemetry(
+  logger?: Logger,
+  options: TelemetryInitOptions = {},
+): TelemetryService | null {
   const tracesEndpoint =
     process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT || process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
   if (!tracesEndpoint) {
@@ -342,18 +465,21 @@ export function initTelemetry(logger?: Logger): TelemetryService | null {
       headers["Authorization"] = `Bearer ${apiKey}`;
     }
 
-    const exporter = new OTLPTraceExporter({
-      url: tracesEndpoint,
-      headers,
-      timeoutMillis: 1500,
-    });
-
-    const batchProcessor = new BatchSpanProcessor(exporter, {
-      maxQueueSize: 2048,
-      maxExportBatchSize: 128,
-      scheduledDelayMillis: 5000,
-      exportTimeoutMillis: 1500,
-    });
+    const spanProcessors = options.spanProcessors ?? [
+      new BatchSpanProcessor(
+        new OTLPTraceExporter({
+          url: tracesEndpoint,
+          headers,
+          timeoutMillis: 1500,
+        }),
+        {
+          maxQueueSize: 2048,
+          maxExportBatchSize: 128,
+          scheduledDelayMillis: 5000,
+          exportTimeoutMillis: 1500,
+        },
+      ),
+    ];
 
     const resource = resourceFromAttributes({
       [ATTR_SERVICE_NAME]: serviceName,
@@ -362,14 +488,16 @@ export function initTelemetry(logger?: Logger): TelemetryService | null {
 
     const provider = new NodeTracerProvider({
       resource,
-      spanProcessors: [batchProcessor],
+      spanProcessors,
       spanLimits: {
         attributeValueLengthLimit: 8192,
       },
     });
 
     provider.register();
-    const tracer = trace.getTracer("claude-agent-acp", getPackageVersion());
+    // From this provider, not the global one: a second provider in one process (a test's) does not replace the first
+    // global registration, and its spans would go to the wrong place.
+    const tracer = provider.getTracer("claude-agent-acp", getPackageVersion());
     const costTracker = new RobustDifferentialCostTracker();
 
     return {
@@ -420,7 +548,10 @@ export function initTelemetry(logger?: Logger): TelemetryService | null {
         );
 
         // Keyed by Anthropic immutable tool_use_id (toolu_*)
-        const activeToolSpans = new Map<string, Span>();
+        const activeToolSpans = new Map<string, { span: Span; toolName: string }>();
+        // Messages steered into this turn whose span is still open, keyed by the uuid the SDK got them with
+        const openSteerSpans = new Map<string, Span>();
+        let steersSeen = 0;
         let hasEnded = false;
 
         return {
@@ -456,7 +587,7 @@ export function initTelemetry(logger?: Logger): TelemetryService | null {
               rootContext,
             );
 
-            activeToolSpans.set(toolCallId, toolSpan);
+            activeToolSpans.set(toolCallId, { span: toolSpan, toolName });
           },
 
           endToolSpan(
@@ -465,8 +596,8 @@ export function initTelemetry(logger?: Logger): TelemetryService | null {
             isError?: boolean,
             toolName?: string,
           ): void {
-            const toolSpan = activeToolSpans.get(toolCallId);
-            if (!toolSpan) {
+            const active = activeToolSpans.get(toolCallId);
+            if (!active) {
               if (toolName) {
                 rootSpan.addEvent("unmapped_tool_result", {
                   "tool.call_id": toolCallId,
@@ -475,10 +606,20 @@ export function initTelemetry(logger?: Logger): TelemetryService | null {
               }
               return;
             }
+            const toolSpan = active.span;
 
             // Invariant 5: Privacy-First Metadata-Only
             const outputBytes = computeOutputBytes(output);
             toolSpan.setAttribute("tool.output_bytes", outputBytes);
+
+            // The one thing lifted out of a result: the id of the Buzz message a posting tool says it posted, so a later
+            // turn that replies to that message can be tied to this one. Only the id, never the result's text.
+            if (!isError && POSTED_EVENT_TOOLS.has(active.toolName)) {
+              const postedEventId = extractPostedEventId(output);
+              if (postedEventId) {
+                toolSpan.setAttribute("nostr.posted_event_id", postedEventId);
+              }
+            }
 
             if (process.env.OTEL_CAPTURE_TOOL_OUTPUT === "true" && output !== undefined) {
               const rawStr = typeof output === "string" ? output : JSON.stringify(output);
@@ -502,6 +643,65 @@ export function initTelemetry(logger?: Logger): TelemetryService | null {
 
             toolSpan.end();
             activeToolSpans.delete(toolCallId);
+          },
+
+          startSteerSpan(steer: SteerSpanInput): void {
+            // A span started after the turn ended would never be closed.
+            if (hasEnded || openSteerSpans.has(steer.uuid)) return;
+            try {
+              steersSeen++;
+              if (steersSeen > MAX_STEER_SPANS_PER_TURN) {
+                if (steersSeen === MAX_STEER_SPANS_PER_TURN + 1) {
+                  rootSpan.addEvent("steer_spans_capped", { "steer.span_cap": steersSeen - 1 });
+                }
+                return;
+              }
+              // The same redaction and cut as the turn's own prompt (see startTurnSpan above)
+              const preTruncated = truncatePayload(steer.text, 32768);
+              const sanitizedText = truncatePayload(redactSecrets(preTruncated), 8192);
+              const meta = steer.nostrMeta;
+              const steerSpan = tracer.startSpan(
+                "steer",
+                {
+                  ...(steer.arrivedAt !== undefined && { startTime: new Date(steer.arrivedAt) }),
+                  attributes: {
+                    "openinference.span.kind": "CHAIN",
+                    "session.id": resolvedSessionId,
+                    "input.value": sanitizedText,
+                    "input.mime_type": "text/plain",
+                    "steer.priority": steer.priority,
+                    "steer.uuid": steer.uuid,
+                    ...(meta?.eventId && { "nostr.event_id": meta.eventId }),
+                    ...(meta?.senderPubkey && { "nostr.sender_pubkey": meta.senderPubkey }),
+                    ...(meta?.senderName && { "nostr.sender_name": meta.senderName }),
+                    ...(meta?.replyToId && { "nostr.reply_to_id": meta.replyToId }),
+                    ...(meta?.threadRootId && { "nostr.thread_root_id": meta.threadRootId }),
+                    ...(meta?.channelId && { "nostr.channel_id": meta.channelId }),
+                  },
+                },
+                rootContext,
+              );
+              openSteerSpans.set(steer.uuid, steerSpan);
+            } catch (err) {
+              logger?.error(
+                `[Telemetry] Could not start a steer span: ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
+          },
+
+          endSteerSpan(uuid: string, delivery: SteerDelivery): void {
+            const steerSpan = openSteerSpans.get(uuid);
+            if (!steerSpan) return;
+            openSteerSpans.delete(uuid);
+            try {
+              steerSpan.setAttributes({ "steer.delivered": true, "steer.end_reason": delivery });
+              steerSpan.setStatus({ code: SpanStatusCode.OK });
+              steerSpan.end();
+            } catch (err) {
+              logger?.error(
+                `[Telemetry] Could not end a steer span: ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
           },
 
           recordUsage(usage: AnthropicUsage, cumulativeCostUsd?: number): void {
@@ -553,7 +753,7 @@ export function initTelemetry(logger?: Logger): TelemetryService | null {
             hasEnded = true;
 
             // Turn boundary sweep: close any orphaned tool spans safely
-            for (const orphanSpan of activeToolSpans.values()) {
+            for (const { span: orphanSpan } of activeToolSpans.values()) {
               orphanSpan.setStatus({
                 code: SpanStatusCode.ERROR,
                 message: "orphaned_at_turn_end",
@@ -563,6 +763,23 @@ export function initTelemetry(logger?: Logger): TelemetryService | null {
               orphanSpan.end();
             }
             activeToolSpans.clear();
+
+            // A steered message the SDK never took before the turn ended (cancel, failure, a hand-off to the next
+            // prompt, the session closing): its span ends with the turn, not delivered. Not an error of the turn.
+            for (const steerSpan of openSteerSpans.values()) {
+              try {
+                steerSpan.setAttributes({
+                  "steer.delivered": false,
+                  "steer.end_reason": "turn_end",
+                });
+                steerSpan.end();
+              } catch (err) {
+                logger?.error(
+                  `[Telemetry] Could not end a steer span: ${err instanceof Error ? err.message : String(err)}`,
+                );
+              }
+            }
+            openSteerSpans.clear();
 
             const outputValue = status === "OK" ? outputOrError : undefined;
             if (outputValue) {
